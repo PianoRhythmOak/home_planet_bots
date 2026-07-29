@@ -1,0 +1,11 @@
+node_modules
+dist
+data
+.env
+config.json
+*.db
+*.db-*
+.git
+.gitignore
+*.log
+README.md
