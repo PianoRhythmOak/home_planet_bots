@@ -2,6 +2,8 @@
 
 TypeScript + discord.js base for Home Planet's bots, with verification as the first feature.
 
+<https://github.com/PianoRhythmOak/home_planet_bots>
+
 The point of the structure: bot #2 should be feature code and nothing else. Config loading, SQLite,
 migrations, logging, slash-command registration, interaction routing, error handling and graceful
 shutdown are all done once in `src/lib/` and shared.
@@ -168,7 +170,7 @@ denial messages. `{user}` in `threadIntro` becomes an @mention.
 
 ## Deploying
 
-**On bot-hosting.net (or any Pterodactyl panel) — follow [DEPLOY.md](DEPLOY.md).** It covers the
+**On [bot-hosting.net](https://bot-hosting.net/a) (or any Pterodactyl panel) — follow [DEPLOY.md](DEPLOY.md).** It covers the
 two things that trip up a first deploy: the panel never compiles TypeScript, and better-sqlite3
 needs a Node version it has a prebuilt Linux binary for.
 

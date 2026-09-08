@@ -1,5 +1,8 @@
 # Deploying to bot-hosting.net
 
+- **Repository:** <https://github.com/PianoRhythmOak/home_planet_bots>
+- **Panel:** <https://bot-hosting.net/a> (sign in with Discord)
+
 bot-hosting.net runs a Pterodactyl panel. Three things about it drive everything below:
 
 1. **It runs `node <entry file>`. It never runs `tsc` for you.** TypeScript has to be compiled
