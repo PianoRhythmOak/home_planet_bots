@@ -1,9 +1,13 @@
 /**
- * Config loading: defaults <- config.json <- .env / environment variables.
+ * Config loading: defaults <- config.json <- config.dev.json (dev only) <- env.
  *
  * Env wins so you can keep the token out of the JSON file. IDs are strings
  * throughout — Discord snowflakes exceed Number.MAX_SAFE_INTEGER, and reading
  * them as numbers silently corrupts them.
+ *
+ * Dev mode is `--dev` on the command line (what `npm run dev` passes) or
+ * BOT_ENV=dev. A CLI flag rather than an inline env var because `FOO=bar cmd`
+ * doesn't work in PowerShell or cmd, and this project lives on Windows.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -14,6 +18,9 @@ import { createLogger } from './logger.js';
 const log = createLogger('config');
 
 export const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+export const IS_DEV =
+  process.argv.includes('--dev') || process.env['BOT_ENV']?.toLowerCase() === 'dev';
 
 export interface VerificationConfig {
   channelId: string;
@@ -119,7 +126,22 @@ function envOverrides(config: BotConfig): BotConfig {
   const v = config.verification;
   const str = (name: string, fallback: string): string => process.env[name]?.trim() || fallback;
 
-  config.token = str('DISCORD_TOKEN', str('BOT_TOKEN', str('TOKEN', config.token)));
+  // A dev-only token, so the local instance can run as a SEPARATE bot application
+  // while the hosted one stays live. Two processes on one token both receive every
+  // interaction and both act on it.
+  const devToken = process.env['DEV_DISCORD_TOKEN']?.trim();
+  if (IS_DEV && devToken) {
+    config.token = devToken;
+  } else {
+    if (IS_DEV) {
+      log.warn(
+        'DEV_DISCORD_TOKEN is not set, so dev mode is using the PRODUCTION token. If the hosted ' +
+          'bot is also running, both will answer every interaction — two threads, two log entries, ' +
+          'two of everything. Make a second bot application for development.',
+      );
+    }
+    config.token = str('DISCORD_TOKEN', str('BOT_TOKEN', str('TOKEN', config.token)));
+  }
   config.guildId = str('GUILD_ID', config.guildId);
   config.databasePath = str('DATABASE_PATH', config.databasePath);
 
@@ -170,23 +192,72 @@ function validate(config: BotConfig): void {
   }
 }
 
+function readJson(name: string, required: boolean): unknown {
+  const path = resolve(ROOT_DIR, name);
+  if (!existsSync(path)) {
+    if (required) log.warn(`No ${name} found — using defaults and environment variables only.`);
+    return {};
+  }
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    log.error(`${name} is not valid JSON: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
 export function loadConfig(): BotConfig {
   loadDotEnv();
 
-  const path = resolve(ROOT_DIR, 'config.json');
-  let fromFile: unknown = {};
-  if (existsSync(path)) {
-    try {
-      fromFile = JSON.parse(readFileSync(path, 'utf8'));
-    } catch (err) {
-      log.error(`config.json is not valid JSON: ${(err as Error).message}`);
-      process.exit(1);
+  let merged = deepMerge(DEFAULTS, readJson('config.json', true));
+
+  if (IS_DEV) {
+    const devPath = resolve(ROOT_DIR, 'config.dev.json');
+    if (!existsSync(devPath)) {
+      log.warn('─'.repeat(70));
+      log.warn('DEV MODE but no config.dev.json — this will run against your REAL channels');
+      log.warn('and roles. Run `npm run setup:test` to create test ones. Continuing anyway.');
+      log.warn('─'.repeat(70));
     }
-  } else {
-    log.warn('No config.json found — using defaults and environment variables only.');
+
+    // Dev overrides sit on top: test channel, test roles, separate database.
+    const dev: unknown = readJson('config.dev.json', false);
+    merged = deepMerge(merged, dev);
+
+    // Never share a database with production, even if config.dev.json forgot to
+    // say so — a dev run would otherwise delete real pending verification threads.
+    // DATABASE_PATH is checked here too: envOverrides() runs after this block and
+    // would otherwise put us straight back onto the production file.
+    const devSetsPath = isPlainObject(dev) && 'databasePath' in dev;
+    if (!devSetsPath && !process.env['DATABASE_PATH']?.trim()) {
+      merged.databasePath = merged.databasePath.replace(/(\.[^.\\/]+)?$/, '.dev$1');
+    } else if (!devSetsPath) {
+      log.warn(
+        'DATABASE_PATH is set in the environment, so dev mode would share the production database. ' +
+          'Unset it, or set databasePath in config.dev.json.',
+      );
+    }
+
+    // Testing happens in the live server, so make the destructive option
+    // impossible to leave on by accident.
+    if (merged.verification.kickOnDeny) {
+      log.warn('kickOnDeny is force-disabled in dev mode — a test deny will not kick anyone.');
+      merged.verification.kickOnDeny = false;
+    }
   }
 
-  const config = envOverrides(deepMerge(DEFAULTS, fromFile));
+  const config = envOverrides(merged);
   validate(config);
+
+  if (IS_DEV) {
+    log.warn('╔══════════════════════════════════════════════════╗');
+    log.warn('║  DEV MODE — config.dev.json overrides are active ║');
+    log.warn('╚══════════════════════════════════════════════════╝');
+    log.warn(`  database:    ${config.databasePath}`);
+    log.warn(`  channel:     ${config.verification.channelId || '(unset)'}`);
+    log.warn(`  log channel: ${config.verification.logChannelId || '(unset)'}`);
+    log.warn(`  verified:    ${config.verification.verifiedRoleId || '(unset)'}`);
+  }
+
   return config;
 }

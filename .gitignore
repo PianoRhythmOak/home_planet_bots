@@ -5,10 +5,12 @@ dist/
 # secrets + runtime state — never commit these
 .env
 config.json
+config.dev.json
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 data/
-_to_delete
-_to_delete/
+
+# deploy bundle built by `npm run package`
+deploy/

@@ -21,10 +21,18 @@ Then in Discord: `/verifycheck` to confirm the setup, `/verifypanel` to post the
 
 | Script | What it does |
 |---|---|
-| `npm run dev` | Runs from source with hot reload (tsx watch) — restarts on save. |
+| `npm run dev` | Hot reload (tsx watch) **in dev mode** — uses `config.dev.json` and `DEV_DISCORD_TOKEN`. |
+| `npm run setup:test` | Builds a hidden test category, channels and roles in your server, and writes `config.dev.json`. |
 | `npm run build` | Compiles `src/` → `dist/`. |
-| `npm start` | Runs the compiled build. This is what production uses. |
+| `npm start` | Runs the compiled build against production config. |
+| `npm test` | Runs the automated unit and SQLite integration tests once. |
+| `npm run test:watch` | Re-runs automated tests as files change. |
 | `npm run typecheck` | Types only, no output. Good for a pre-commit hook. |
+| `npm run dev:prod-config` | Hot reload against the *real* config. Rarely what you want. |
+
+**Testing against the live server is covered in [TESTING.md](TESTING.md)** — read it before the
+first `npm run dev`, since running your local copy on the production token makes the hosted bot and
+your laptop both answer every interaction.
 
 ---
 
@@ -132,6 +140,8 @@ that channel. Pinging a *role* does not add anyone. Pick one:
 
 ## Config
 
+Layering: **defaults → `config.json` → `config.dev.json` (dev only) → `.env` / environment.**
+
 `config.json` holds everything; `.env` overrides it and is the right place for the token.
 **All IDs are strings** — Discord snowflakes are bigger than JSON can safely hold as numbers, and
 unquoting them corrupts them. The bot validates this at startup and tells you which key is wrong.
@@ -157,6 +167,10 @@ denial messages. `{user}` in `threadIntro` becomes an @mention.
 ---
 
 ## Deploying
+
+**On bot-hosting.net (or any Pterodactyl panel) — follow [DEPLOY.md](DEPLOY.md).** It covers the
+two things that trip up a first deploy: the panel never compiles TypeScript, and better-sqlite3
+needs a Node version it has a prebuilt Linux binary for.
 
 **Plain Node** (any VPS, Pterodactyl panel, your own box):
 
