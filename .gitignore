@@ -14,3 +14,9 @@ data/
 
 # deploy bundle built by `npm run package`
 deploy/
+
+# editor / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
