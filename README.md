@@ -53,7 +53,7 @@ src/
     index.ts                  the registry — one array, add your feature here
     verification/
       index.ts                the Feature definition (wiring)
-      commands.ts             /verifypanel /verifyopen /verifycheck
+      commands.ts             /verifypanel /verifyopen /verifycheck /verifytest
       components.ts           button + modal handlers
       service.ts              the actual behaviour
       store.ts                ticket persistence
@@ -157,6 +157,8 @@ unquoting them corrupts them. The bot validates this at startup and tells you wh
 | `verification.staffRoleIds` | Who can press Approve/Deny. Empty = falls back to Manage Server. |
 | `verification.verifiedRoleId` | Granted on approve. `""` = don't touch roles. |
 | `verification.unverifiedRoleId` | Removed on approve. `""` = skip. |
+| `verification.assignUnverifiedOnJoin` | Grant that role when someone joins (default `true`). Turn it off if Discord onboarding or another bot already does it. |
+| `verification.welcomeDmOnJoin` | DM new joiners a nudge toward the panel (default `false`). |
 | `verification.deleteDelaySeconds` | How long the thread lingers after a decision (default 60). |
 | `verification.staleThreadHours` | Auto-close threads staff never answered (default 24, `0` = never). |
 | `verification.kickOnDeny` | Kick the member when denied. |
@@ -164,7 +166,8 @@ unquoting them corrupts them. The bot validates this at startup and tells you wh
 | `verification.transcriptIncludeAttachments` | **Read the privacy note below before enabling.** |
 
 Everything else in `verification` is wording — panel text, button label, thread intro, approval and
-denial messages. `{user}` in `threadIntro` becomes an @mention.
+denial messages. `{user}` in `threadIntro` becomes an @mention; `welcomeDmMessage` also takes
+`{server}` and `{channel}`.
 
 ---
 
@@ -221,12 +224,42 @@ and deletion.
 
 **Member leaves mid-verification** → noticed, logged, cleaned up.
 
+**A new member joins** → unverified role granted (see `assignUnverifiedOnJoin`), optional welcome DM.
+Nothing else happens until they press the panel button themselves.
+
 **Two staff hit Approve at once** → only the first counts; the second gets "already handled". The
 claim is a single synchronous SQL `UPDATE ... WHERE status='open'`, so there's no window between
 check and write for a second click to slip through.
 
 **The bot restarts mid-anything** → SQLite remembers. A sweep runs every 2 minutes and finishes
 whatever was pending.
+
+---
+
+## Testing the flow without a spare account
+
+Staff are verified by definition, so the panel button just tells you you're already verified.
+`/verifytest` (staff only) gets around that. It has three modes:
+
+| Mode | What it does |
+|---|---|
+| `dry-run` | Traces the whole flow — join, panel, thread, decision, log, cleanup — and reports where a real member would get stuck. **Changes nothing.** Start here. |
+| `join` | Runs the join handler against you for real: grants you the unverified role and sends the welcome DM if it's on. Take the role back off yourself afterwards. |
+| `ticket` | Opens a real verification thread for you, skipping the already-verified check. |
+
+A `ticket` drill is the real code path — real thread, real roles, real log entry, real transcript,
+real deletion — with three deliberate differences, all of them visible in the thread:
+
+- the thread is named `TEST-verify-*` and the intro says it's a drill,
+- staff are shown in the ping but **not actually notified**,
+- **Deny will not kick you**, even with `kickOnDeny` on.
+
+That last one is why the flag lives in the database rather than being read off the thread name — a
+restart between opening and denying must not quietly re-arm the kick against a moderator.
+
+`/verifycheck` and `/verifytest dry-run` overlap on permissions but answer different questions:
+`verifycheck` is "is this configured right", `dry-run` is "if someone joined right now, what
+would happen to them".
 
 ---
 

@@ -3,7 +3,7 @@ import { defineEvent, type Feature } from '../../lib/types.js';
 import { commands } from './commands.js';
 import { components } from './components.js';
 import { startJanitor, stopJanitor } from './janitor.js';
-import { abandonTicket, bindStore, warmMemberCache } from './service.js';
+import { abandonTicket, bindStore, handleMemberJoin, warmMemberCache } from './service.js';
 import { TicketStore } from './store.js';
 
 export const verificationFeature: Feature = {
@@ -11,6 +11,12 @@ export const verificationFeature: Feature = {
   commands,
   components,
   events: [
+    defineEvent({
+      event: Events.GuildMemberAdd,
+      async execute(ctx, member) {
+        await handleMemberJoin(ctx, member);
+      },
+    }),
     defineEvent({
       event: Events.GuildMemberRemove,
       async execute(ctx, member) {

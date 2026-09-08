@@ -28,6 +28,8 @@ export interface VerificationConfig {
   staffRoleIds: string[];
   verifiedRoleId: string;
   unverifiedRoleId: string;
+  assignUnverifiedOnJoin: boolean;
+  welcomeDmOnJoin: boolean;
   deleteDelaySeconds: number;
   staleThreadHours: number;
   kickOnDeny: boolean;
@@ -42,6 +44,7 @@ export interface VerificationConfig {
   threadIntro: string;
   approvedMessage: string;
   deniedMessage: string;
+  welcomeDmMessage: string;
 }
 
 export interface BotConfig {
@@ -63,6 +66,11 @@ const DEFAULTS: BotConfig = {
     staffRoleIds: [],
     verifiedRoleId: '',
     unverifiedRoleId: '',
+    assignUnverifiedOnJoin: true,
+    // Off by default: a bot DM to every single joiner is the kind of thing that
+    // gets an application rate-limited, and most people have DMs from servers
+    // switched off anyway. Turn it on if the panel channel is easy to miss.
+    welcomeDmOnJoin: false,
     deleteDelaySeconds: 60,
     staleThreadHours: 24,
     kickOnDeny: false,
@@ -83,6 +91,10 @@ const DEFAULTS: BotConfig = {
       'This thread is private and will be **deleted** when we\'re finished.',
     approvedMessage: "✅ You're verified — welcome to Home Planet! This thread will close shortly.",
     deniedMessage: "❌ Your verification wasn't approved. This thread will close shortly.",
+    welcomeDmMessage:
+      'Welcome to **{server}**! 🪐\n\n' +
+      "This server is **21+**, so there's one step before you get in: head to {channel} and press " +
+      '**Start Verification**. That opens a private thread with staff — just you and them.',
   },
 };
 

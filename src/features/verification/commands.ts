@@ -7,10 +7,19 @@ import {
   SlashCommandBuilder,
   type Guild,
   type GuildBasedChannel,
+  type GuildMember,
   type TextChannel,
 } from 'discord.js';
 import type { Command } from '../../lib/types.js';
-import { COLOURS, getStore, panelComponents } from './service.js';
+import {
+  COLOURS,
+  dryRun,
+  getStore,
+  handleMemberJoin,
+  isStaff,
+  openTicket,
+  panelComponents,
+} from './service.js';
 
 const verifypanel: Command = {
   data: new SlashCommandBuilder()
@@ -223,4 +232,112 @@ const verifycheck: Command = {
   },
 };
 
-export const commands: Command[] = [verifypanel, verifyopen, verifycheck];
+const verifytest: Command = {
+  data: new SlashCommandBuilder()
+    .setName('verifytest')
+    .setDescription('Test the verification flow on yourself, without waiting for a real joiner.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .setContexts(InteractionContextType.Guild)
+    .addStringOption((opt) =>
+      opt
+        .setName('mode')
+        .setDescription('What to test')
+        .setRequired(true)
+        .addChoices(
+          { name: 'dry-run — report what would happen, change nothing', value: 'dry-run' },
+          { name: 'join — run the join handler against you for real', value: 'join' },
+          { name: 'ticket — open a real (but marked) verification thread for you', value: 'ticket' },
+        ),
+    )
+    .toJSON(),
+
+  async execute(interaction, ctx) {
+    const guild = interaction.guild;
+    const member = interaction.member as GuildMember | null;
+    if (!guild || !member) {
+      await interaction.reply({
+        content: 'This only works inside the server.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    // setDefaultMemberPermissions is only a default — an admin can hand this
+    // command to any role in Server Settings → Integrations. The real gate is here.
+    if (!isStaff(member, ctx.config.verification.staffRoleIds)) {
+      await interaction.reply({
+        content: 'Only staff can run verification tests.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const mode = interaction.options.getString('mode', true);
+    const cfg = ctx.config.verification;
+
+    if (mode === 'ticket') {
+      // Straight through the real code path, flagged as a drill. openTicket does
+      // its own defer/reply, so nothing is acked before this point.
+      await openTicket(interaction, ctx, { test: true });
+      return;
+    }
+
+    if (mode === 'join') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const hadRole = Boolean(cfg.unverifiedRoleId && member.roles.cache.has(cfg.unverifiedRoleId));
+
+      await handleMemberJoin(ctx, member);
+
+      const fresh = await guild.members.fetch({ user: member.id, force: true }).catch(() => null);
+      const hasRole = Boolean(
+        cfg.unverifiedRoleId && fresh?.roles.cache.has(cfg.unverifiedRoleId),
+      );
+
+      const lines = [
+        '**Ran the join handler against you for real.**',
+        '',
+        cfg.assignUnverifiedOnJoin && cfg.unverifiedRoleId
+          ? hasRole
+            ? hadRole
+              ? `➖ You already had <@&${cfg.unverifiedRoleId}> — nothing changed.`
+              : `✅ Gave you <@&${cfg.unverifiedRoleId}>. **Remove it from yourself when you're done.**`
+            : `❌ The role was NOT granted — check the bot logs, and run \`/verifycheck\`.`
+          : '➖ Role assignment is off or no role is set, so nothing was granted.',
+        cfg.welcomeDmOnJoin
+          ? '📨 Welcome DM sent — check your DMs. Nothing there means you have server DMs closed, ' +
+            'which is exactly what a real joiner would hit.'
+          : '➖ No DM (`welcomeDmOnJoin` is off).',
+      ];
+
+      await interaction.editReply(lines.join('\n'));
+      return;
+    }
+
+    // dry-run
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const channel = cfg.channelId
+      ? await guild.channels.fetch(cfg.channelId).catch(() => null)
+      : ((interaction.channel as GuildBasedChannel | null) ?? null);
+
+    if (channel?.type !== ChannelType.GuildText) {
+      await interaction.editReply(
+        'The verification channel is not set to a text channel, so there is no flow to trace. ' +
+          'Fix `verification.channelId`, then run `/verifycheck`.',
+      );
+      return;
+    }
+
+    const report = await dryRun(ctx, member, channel as TextChannel);
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('Verification flow — dry run')
+          .setDescription(report.join('\n').slice(0, 4000))
+          .setColor(COLOURS.brand)
+          .setFooter({ text: 'Nothing was changed. /verifycheck covers setup; this covers the flow.' }),
+      ],
+    });
+  },
+};
+
+export const commands: Command[] = [verifypanel, verifyopen, verifycheck, verifytest];

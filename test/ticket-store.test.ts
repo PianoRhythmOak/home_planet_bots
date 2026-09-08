@@ -70,6 +70,53 @@ describe('TicketStore', () => {
     assert.equal(store.get('thread-1'), undefined);
   });
 
+  it('flags test tickets and defaults real ones to 0', () => {
+    store.create('thread-real', 'guild-1', 'channel-1', 'user-1');
+    store.create('thread-test', 'guild-1', 'channel-1', 'user-2', true);
+
+    assert.equal(store.get('thread-real')?.is_test, 0);
+    assert.equal(store.get('thread-test')?.is_test, 1);
+  });
+
+  it('keeps is_test through a claim and finish, so a restart still knows it was a drill', () => {
+    // finalizeTicket reads is_test off the row to suppress the kick. If the flag
+    // didn't survive the decision path, a denied drill would kick a moderator.
+    store.create('thread-test', 'guild-1', 'channel-1', 'user-1', true);
+    assert.equal(store.claim('thread-test'), true);
+    store.finish('thread-test', 'denied', 'staff-1', 'testing', new Date(0));
+
+    assert.equal(store.get('thread-test')?.is_test, 1);
+    assert.equal(store.due()[0]?.is_test, 1);
+  });
+
+  it('adds is_test to a database created before the column existed', () => {
+    // The upgrade path a live bot actually takes: an existing v1 database gets
+    // only the ALTER, and rows written before it must read as not-a-test.
+    const old = new Database(':memory:');
+    old.exec(`CREATE TABLE tickets (
+       thread_id  TEXT PRIMARY KEY,
+       guild_id   TEXT NOT NULL,
+       channel_id TEXT NOT NULL,
+       user_id    TEXT NOT NULL,
+       created_at TEXT NOT NULL,
+       status     TEXT NOT NULL DEFAULT 'open',
+       decision   TEXT,
+       staff_id   TEXT,
+       reason     TEXT,
+       delete_at  TEXT,
+       attempts   INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE TABLE schema_versions (namespace TEXT PRIMARY KEY, version INTEGER NOT NULL);
+     INSERT INTO schema_versions VALUES ('verification', 1);
+     INSERT INTO tickets (thread_id, guild_id, channel_id, user_id, created_at)
+       VALUES ('legacy', 'guild-1', 'channel-1', 'user-1', '2026-01-01T00:00:00.000Z');`);
+
+    const upgraded = new TicketStore(old);
+    assert.equal(upgraded.get('legacy')?.is_test, 0);
+    assert.equal(upgraded.get('legacy')?.status, 'open');
+    old.close();
+  });
+
   it('filters and orders open tickets by guild', () => {
     store.create('thread-b', 'guild-1', 'channel-1', 'user-2');
     store.create('thread-a', 'guild-2', 'channel-1', 'user-1');

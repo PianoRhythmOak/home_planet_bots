@@ -17,6 +17,7 @@ import {
   TimestampStyles,
   time,
   type ButtonInteraction,
+  type ChatInputCommandInteraction,
   type Guild,
   type GuildMember,
   type Message,
@@ -328,10 +329,311 @@ async function addStaffToThread(thread: ThreadChannel, guild: Guild, ctx: BotCon
   }
 }
 
-export async function openTicket(interaction: ButtonInteraction, ctx: BotContext): Promise<void> {
+/**
+ * A new member arrived.
+ *
+ * Two jobs, both best-effort and both optional:
+ *
+ *  1. Hand them the unverified role. This is the half that actually gates the
+ *     server — every other path in this feature only ever *removes* that role,
+ *     so without this something else (Discord's onboarding, another bot) has to
+ *     be granting it, and if nothing is, joiners land in the server unrestricted.
+ *  2. DM them a nudge toward the panel channel, since nothing otherwise tells a
+ *     new member which of forty channels to look in.
+ *
+ * Nothing in here throws. There is no retry path for a join — the janitor only
+ * knows about open tickets, and a member we failed to process is already inside
+ * the server — so a failure is logged loudly and the member is left alone.
+ */
+export async function handleMemberJoin(ctx: BotContext, member: GuildMember): Promise<void> {
+  const cfg = ctx.config.verification;
+
+  if (member.user.bot) return;
+  // The config names exactly one guild; anywhere else is not ours to touch.
+  if (ctx.config.guildId && member.guild.id !== ctx.config.guildId) return;
+
+  if (cfg.assignUnverifiedOnJoin && cfg.unverifiedRoleId) {
+    try {
+      await member.roles.add(cfg.unverifiedRoleId, 'Joined — awaiting verification');
+      log.info(`Gave the unverified role to ${member.user.tag} (${member.id})`);
+    } catch (err) {
+      // Almost always one of two things: the role sits above the bot's top role,
+      // or Manage Roles is missing. Both are setup problems /verifycheck reports.
+      if (err instanceof DiscordAPIError && err.code === 50013) {
+        log.error(
+          `Can't give ${member.user.tag} the unverified role — I need Manage Roles and a role above it. ` +
+            'Run /verifycheck. Until this is fixed, joiners are landing in the server ungated.',
+        );
+      } else {
+        log.error(`Failed to give ${member.user.tag} the unverified role:`, err);
+      }
+    }
+  }
+
+  if (!cfg.welcomeDmOnJoin) return;
+
+  const text = cfg.welcomeDmMessage
+    .replaceAll('{user}', member.toString())
+    .replaceAll('{server}', member.guild.name)
+    .replaceAll('{channel}', cfg.channelId ? `<#${cfg.channelId}>` : 'the verification channel');
+
+  try {
+    await member.send({
+      embeds: [new EmbedBuilder().setDescription(text).setColor(COLOURS.brand)],
+    });
+  } catch (err) {
+    // 50007 is "cannot send messages to this user" — closed DMs, not a fault.
+    // It's the common case, so it must not read as an error in the log.
+    if (err instanceof DiscordAPIError && err.code === 50007) {
+      log.debug(`${member.user.tag} has DMs closed — no welcome sent.`);
+    } else {
+      log.warn(`Welcome DM to ${member.user.tag} failed:`, err);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// dry run
+// ---------------------------------------------------------------------------
+
+/**
+ * Walks the whole verification flow for one member and reports what *would*
+ * happen, touching nothing.
+ *
+ * Deliberately different from /verifycheck: that answers "is the bot configured
+ * correctly", this answers "if this person went through right now, where would
+ * they get stuck". The overlap is only in permissions, and the phrasing here
+ * stays in terms of the consequence rather than the permission name.
+ */
+export async function dryRun(
+  ctx: BotContext,
+  member: GuildMember,
+  channel: TextChannel,
+): Promise<string[]> {
+  const cfg = ctx.config.verification;
+  const guild = member.guild;
+  const me = await guild.members.fetchMe();
+  const perms = channel.permissionsFor(me);
+  const out: string[] = [];
+
+  const yes = (s: string): string => `✅ ${s}`;
+  const no = (s: string): string => `❌ ${s}`;
+  const meh = (s: string): string => `➖ ${s}`;
+
+  const roleBlockedBy = (roleId: string): string | null => {
+    const role = guild.roles.cache.get(roleId);
+    if (!role) return 'the ID in config points at no role';
+    if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) return "I don't have Manage Roles";
+    if (me.roles.highest.comparePositionTo(role) <= 0) return `my top role is not above ${role.name}`;
+    return null;
+  };
+
+  // --- 1. they join
+  out.push('**1 · They join the server**');
+  if (!cfg.assignUnverifiedOnJoin) {
+    out.push(meh('  I leave roles alone (`assignUnverifiedOnJoin` is off) — something else must gate them.'));
+  } else if (!cfg.unverifiedRoleId) {
+    out.push(meh('  No unverified role set, so nothing is granted. They land in the server ungated.'));
+  } else {
+    const blocked = roleBlockedBy(cfg.unverifiedRoleId);
+    out.push(
+      blocked
+        ? no(`  Unverified role would FAIL — ${blocked}. They'd land in the server ungated.`)
+        : yes(`  They get <@&${cfg.unverifiedRoleId}>.`),
+    );
+  }
+  out.push(
+    cfg.welcomeDmOnJoin
+      ? yes('  I DM them a nudge toward the panel (unless their DMs are closed).')
+      : meh('  No welcome DM (`welcomeDmOnJoin` is off) — they have to find the channel themselves.'),
+  );
+
+  // --- 2. they find the panel
+  out.push('\n**2 · They find the panel**');
+  let panelFound = false;
+  if (!perms.has(PermissionFlagsBits.ReadMessageHistory)) {
+    out.push(meh(`  Can't check ${channel.toString()} for a panel — I can't read its history.`));
+  } else {
+    try {
+      const recent = await channel.messages.fetch({ limit: 50 });
+      panelFound = recent.some(
+        (m) =>
+          m.author.id === me.id &&
+          m.components.some((row) =>
+            // A panel is any message of mine still carrying the start button.
+            JSON.stringify(row.toJSON()).includes(IDS.start),
+          ),
+      );
+    } catch {
+      out.push(meh(`  Couldn't read ${channel.toString()} to look for the panel.`));
+    }
+    out.push(
+      panelFound
+        ? yes(`  The panel is up in ${channel.toString()}.`)
+        : no(
+            `  **No panel in ${channel.toString()}** (last 50 messages). Nothing to click — ` +
+              'run `/verifypanel` in there. This blocks everything below.',
+          ),
+    );
+  }
+
+  // --- 3. they press the button
+  out.push('\n**3 · They press the button**');
+  const canThread =
+    perms.has(PermissionFlagsBits.CreatePrivateThreads) &&
+    perms.has(PermissionFlagsBits.SendMessagesInThreads);
+  out.push(
+    canThread
+      ? yes('  A private thread opens, just them and staff.')
+      : no("  Thread creation FAILS — I can't create private threads or post in them here."),
+  );
+
+  if (cfg.staffRoleIds.length === 0) {
+    out.push(meh('  No staff roles configured — the buttons fall back to anyone with Manage Server.'));
+  } else {
+    const staffWithAccess = cfg.staffRoleIds.filter((id) =>
+      channel.permissionsFor(guild.roles.cache.get(id) ?? me).has(PermissionFlagsBits.ManageThreads),
+    ).length;
+    if (cfg.addStaffToThread) {
+      await warmMemberCache(guild);
+      const people = new Set<string>();
+      for (const id of cfg.staffRoleIds) {
+        for (const m of guild.roles.cache.get(id)?.members.values() ?? []) {
+          if (!m.user.bot) people.add(m.id);
+        }
+      }
+      const added = Math.min(people.size, cfg.maxStaffAdded);
+      out.push(
+        people.size === 0
+          ? no('  **Nobody would be added to the thread** — no members found in the staff roles.')
+          : yes(
+              `  ${added} staff added to the thread` +
+                (people.size > cfg.maxStaffAdded ? ` (capped from ${people.size} by maxStaffAdded)` : '') +
+                '.',
+            ),
+      );
+    } else if (staffWithAccess === 0) {
+      out.push(
+        no(
+          '  **No staff would see the thread** — `addStaffToThread` is off and no staff role has ' +
+            'Manage Threads here. Private threads are invisible without one or the other.',
+        ),
+      );
+    } else {
+      out.push(yes(`  ${staffWithAccess} staff role(s) can see all private threads here.`));
+    }
+    out.push(
+      cfg.pingStaffOnOpen
+        ? yes(`  ${cfg.staffRoleIds.length} staff role(s) get pinged.`)
+        : meh('  No staff ping (`pingStaffOnOpen` is off) — someone has to be watching.'),
+    );
+  }
+
+  // --- 4. staff decide
+  out.push('\n**4 · Staff press Approve / Deny**');
+  if (!cfg.verifiedRoleId) {
+    out.push(meh("  No verified role set — approving grants nothing."));
+  } else {
+    const blocked = roleBlockedBy(cfg.verifiedRoleId);
+    out.push(
+      blocked
+        ? no(`  Approve would FAIL to grant the role — ${blocked}.`)
+        : yes(`  Approve grants <@&${cfg.verifiedRoleId}>.`),
+    );
+  }
+  if (cfg.unverifiedRoleId) {
+    const blocked = roleBlockedBy(cfg.unverifiedRoleId);
+    out.push(
+      blocked
+        ? no(`  Approve would FAIL to remove the unverified role — ${blocked}.`)
+        : yes('  Approve removes the unverified role.'),
+    );
+  }
+  if (cfg.kickOnDeny) {
+    out.push(
+      me.permissions.has(PermissionFlagsBits.KickMembers)
+        ? yes('  **Deny kicks them** (`kickOnDeny` is on). Suppressed on a `/verifytest ticket` drill.')
+        : no("  `kickOnDeny` is on but I can't kick — denies would log a failure instead."),
+    );
+  } else {
+    out.push(meh('  Deny does not kick (`kickOnDeny` is off).'));
+  }
+
+  // --- 5. the paper trail
+  out.push('\n**5 · Log and cleanup**');
+  const logChannel = cfg.logChannelId
+    ? await guild.channels.fetch(cfg.logChannelId).catch(() => null)
+    : null;
+  if (!logChannel) {
+    out.push(no('  **No log entry** — the log channel is unset or I can\'t see it.'));
+  } else {
+    const lperms = logChannel.permissionsFor(me);
+    out.push(
+      lperms?.has(PermissionFlagsBits.SendMessages)
+        ? yes(`  Decision logged to ${logChannel.toString()}.`)
+        : no(`  I can't post in ${logChannel.toString()} — decisions would go unlogged.`),
+    );
+    if (cfg.logTranscripts) {
+      out.push(
+        lperms?.has(PermissionFlagsBits.AttachFiles)
+          ? yes(
+              '  Transcript attached' +
+                (cfg.transcriptIncludeAttachments
+                  ? ' — **including attachment links** (ID photos land in the log permanently).'
+                  : ' (attachment links stripped).'),
+            )
+          : no("  Transcripts are on but I can't attach files there."),
+      );
+    } else {
+      out.push(meh('  No transcript (`logTranscripts` is off) — the thread is deleted unrecorded.'));
+    }
+  }
+  out.push(
+    perms.has(PermissionFlagsBits.ManageThreads)
+      ? yes(`  Thread deleted ${cfg.deleteDelaySeconds}s later.`)
+      : no('  **I can\'t delete threads here** — they\'d be parked and pile up in the channel.'),
+  );
+  out.push(
+    cfg.staleThreadHours > 0
+      ? yes(`  Unanswered threads auto-expire after ${cfg.staleThreadHours}h.`)
+      : meh('  Unanswered threads never expire (`staleThreadHours` is 0).'),
+  );
+
+  // --- where this particular member stands
+  out.push(`\n**Right now, for ${member.toString()}**`);
+  const verified = Boolean(cfg.verifiedRoleId && member.roles.cache.has(cfg.verifiedRoleId));
+  out.push(
+    meh(
+      verified
+        ? "  Already verified — the panel button would say so and stop. Use `/verifytest ticket` to test anyway."
+        : '  Not verified — the panel button would open a thread.',
+    ),
+  );
+  const openRow = store.openForUser(guild.id, member.id);
+  if (openRow) out.push(meh(`  Has an open ticket already: <#${openRow.thread_id}>.`));
+  const openCount = store.open(guild.id).length;
+  out.push(meh(`  ${openCount} ticket(s) open server-wide.`));
+
+  return out;
+}
+
+/**
+ * `test: true` is /verifytest's live mode. It changes exactly three things —
+ * the already-verified guard is skipped (staff running a drill are verified by
+ * definition, which is the whole reason they can't test this by hand), the row
+ * is flagged so the decision path can suppress the kick, and the thread says so
+ * in big letters. Everything else runs for real, because a drill that skips the
+ * interesting parts proves nothing.
+ */
+export async function openTicket(
+  interaction: ButtonInteraction | ChatInputCommandInteraction,
+  ctx: BotContext,
+  opts: { test?: boolean } = {},
+): Promise<void> {
   const cfg = ctx.config.verification;
   const { guild } = interaction;
   const member = interaction.member as GuildMember | null;
+  const isTest = opts.test === true;
 
   if (!guild || !member) {
     await interaction.reply({
@@ -341,7 +643,7 @@ export async function openTicket(interaction: ButtonInteraction, ctx: BotContext
     return;
   }
 
-  if (cfg.verifiedRoleId && member.roles.cache.has(cfg.verifiedRoleId)) {
+  if (!isTest && cfg.verifiedRoleId && member.roles.cache.has(cfg.verifiedRoleId)) {
     await interaction.reply({
       content: "You're already verified. 🪐",
       flags: MessageFlags.Ephemeral,
@@ -386,13 +688,15 @@ export async function openTicket(interaction: ButtonInteraction, ctx: BotContext
   let thread: ThreadChannel;
   try {
     thread = await (channel as TextChannel).threads.create({
-      name: `verify-${safeName}`,
+      name: isTest ? `TEST-verify-${safeName}` : `verify-${safeName}`,
       type: ChannelType.PrivateThread,
       invitable: false,
       // 7 days, so Discord doesn't archive the thread out from under us before
       // staleThreadHours (default 24) gets a chance to expire it.
       autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
-      reason: `Verification for ${member.user.tag} (${member.id})`,
+      reason: isTest
+        ? `Verification DRILL for ${member.user.tag} (${member.id})`
+        : `Verification for ${member.user.tag} (${member.id})`,
     });
   } catch (err) {
     if (err instanceof DiscordAPIError && (err.code === 50013 || err.code === 50001)) {
@@ -407,17 +711,28 @@ export async function openTicket(interaction: ButtonInteraction, ctx: BotContext
     return;
   }
 
-  store.create(thread.id, guild.id, channel.id, member.id);
+  store.create(thread.id, guild.id, channel.id, member.id, isTest);
 
   await thread.members.add(member.id).catch(() => {
     log.warn(`Could not add ${member.user.tag} to thread ${thread.id}`);
   });
   await addStaffToThread(thread, guild, ctx);
 
+  const introText = cfg.threadIntro
+    .replaceAll('{user}', member.toString())
+    .replaceAll('{server}', guild.name);
+
   const intro = new EmbedBuilder()
-    .setTitle('Verification')
-    .setDescription(cfg.threadIntro.replaceAll('{user}', member.toString()).replaceAll('{server}', guild.name))
-    .setColor(COLOURS.brand)
+    .setTitle(isTest ? '🧪 Verification — TEST RUN' : 'Verification')
+    .setDescription(
+      isTest
+        ? '**This is a drill.** Staff opened it with `/verifytest` to check the flow end to end.\n' +
+          'The buttons below do the real thing — roles, log entry, transcript, deletion — except the ' +
+          'kick, which is suppressed on a test ticket.\n\n───\n\n' +
+          introText
+        : introText,
+    )
+    .setColor(isTest ? COLOURS.muted : COLOURS.brand)
     .setThumbnail(member.displayAvatarURL())
     .setFooter({ text: `User ID: ${member.id}` })
     .setTimestamp(new Date())
@@ -440,16 +755,25 @@ export async function openTicket(interaction: ButtonInteraction, ctx: BotContext
       content: `${member.toString()} ${ping}`.trim(),
       embeds: [intro],
       components: [staffControls()],
-      allowedMentions: { users: [member.id], roles: cfg.staffRoleIds },
+      // A drill renders the staff ping so you can see it's aimed at the right
+      // roles, but doesn't actually notify them — the point is to test the flow,
+      // not to cry wolf at everyone holding a staff role.
+      allowedMentions: isTest
+        ? { users: [], roles: [] }
+        : { users: [member.id], roles: cfg.staffRoleIds },
     })
     .catch((err: unknown) => log.warn('Could not post intro in thread:', err));
 
   await interaction.editReply(
-    `Your private verification thread is open: ${thread.toString()} — head over there. 🪐`,
+    isTest
+      ? `🧪 Test thread open: ${thread.toString()}\n\nIt behaves exactly like a real one. Press **Approve**, ` +
+        '**Deny** or **Close** in there and watch the role change, the log entry, the transcript and the ' +
+        'delete land. Staff were **not** pinged, and Deny will **not** kick you.'
+      : `Your private verification thread is open: ${thread.toString()} — head over there. 🪐`,
   );
 
   await writeLog(ctx, {
-    title: '🆕 Verification opened',
+    title: isTest ? '🧪 Test verification opened' : '🆕 Verification opened',
     colour: COLOURS.muted,
     applicant: member,
     applicantId: member.id,
@@ -544,7 +868,12 @@ export async function finalizeTicket(
     }
   }
 
-  if (decision === 'denied' && cfg.kickOnDeny && member) {
+  if (decision === 'denied' && cfg.kickOnDeny && member && row.is_test) {
+    // The one thing a drill must not do. Everything else on this path is a no-op
+    // or reversible for a staff member; a kick is neither, and losing a moderator
+    // to a flow test would be a memorable way to find that out.
+    notes.push('🧪 Test ticket — kick suppressed (kickOnDeny would have kicked here).');
+  } else if (decision === 'denied' && cfg.kickOnDeny && member) {
     // Safe to kick here: the ticket is already claimed, so the guildMemberRemove
     // handler will find nothing to do and won't double-log.
     try {
@@ -581,7 +910,9 @@ export async function finalizeTicket(
 
   const transcript = await buildTranscript(thread, ctx);
   await writeLog(ctx, {
-    title: TITLES[decision],
+    // Marked in the log too — a staff member scrolling back a month shouldn't
+    // read a drill as a real denial against a real person.
+    title: row.is_test ? `🧪 [TEST] ${TITLES[decision]}` : TITLES[decision],
     colour,
     applicant: member,
     applicantId: row.user_id,

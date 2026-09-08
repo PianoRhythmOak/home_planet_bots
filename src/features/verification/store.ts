@@ -21,6 +21,8 @@ export interface TicketRow {
   reason: string | null;
   delete_at: string | null;
   attempts: number;
+  /** 1 when opened by /verifytest. Suppresses the irreversible parts of a decision. */
+  is_test: number;
 }
 
 /**
@@ -46,6 +48,11 @@ const MIGRATIONS = [
    );
    CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets (guild_id, user_id, status);
    CREATE INDEX IF NOT EXISTS idx_tickets_due  ON tickets (status, delete_at);`,
+
+  // Tickets opened by /verifytest. Kept on the row rather than inferred from the
+  // thread's name, because the decision path has to still know it's a drill after
+  // a restart — and a renamed thread would then quietly re-arm kickOnDeny.
+  `ALTER TABLE tickets ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export class TicketStore {
@@ -53,13 +60,19 @@ export class TicketStore {
     migrate(db, 'verification', MIGRATIONS);
   }
 
-  create(threadId: string, guildId: string, channelId: string, userId: string): void {
+  create(
+    threadId: string,
+    guildId: string,
+    channelId: string,
+    userId: string,
+    isTest = false,
+  ): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO tickets (thread_id, guild_id, channel_id, user_id, created_at, status)
-         VALUES (?, ?, ?, ?, ?, 'open')`,
+        `INSERT OR REPLACE INTO tickets (thread_id, guild_id, channel_id, user_id, created_at, status, is_test)
+         VALUES (?, ?, ?, ?, ?, 'open', ?)`,
       )
-      .run(threadId, guildId, channelId, userId, new Date().toISOString());
+      .run(threadId, guildId, channelId, userId, new Date().toISOString(), isTest ? 1 : 0);
   }
 
   get(threadId: string): TicketRow | undefined {

@@ -85,6 +85,11 @@ config. It does what it says; be careful.
 
 ## What to actually test
 
+**Start with `/verifytest dry-run`.** It walks the whole flow and tells you where a real member
+would get stuck — including whether a panel is actually posted, which is the one thing every other
+check assumes. `/verifytest ticket` then opens a real (but marked) thread for you, so you don't
+need an alt for most of the list below. Deny is kick-safe on those tickets.
+
 The happy path is the easy part. These are the cases worth walking through:
 
 1. **Approve** — from an alt account (or ask another admin). Check: role granted, log entry with
@@ -102,6 +107,8 @@ The happy path is the easy part. These are the cases worth walking through:
 9. **Leave mid-verification** — open a thread on an alt, then have the alt leave the server. Should
    log "abandoned" and clean up.
 10. **Expiry** — set `staleThreadHours` to something tiny in `config.dev.json`, open a thread, wait.
+11. **A new join** — `/verifytest join` on yourself, or watch a real alt join. Check the unverified
+    role lands and that it actually gates the channels you think it gates.
 
 To reset between runs: stop the bot, delete `data/bot.dev.db`, delete any leftover test threads.
 
