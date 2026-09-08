@@ -8,6 +8,10 @@
   "engines": {
     "node": ">=20.10.0 <24"
   },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "esbuild": true
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts --dev",
     "dev:prod-config": "tsx watch src/index.ts",

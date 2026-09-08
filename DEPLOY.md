@@ -5,10 +5,10 @@ bot-hosting.net runs a Pterodactyl panel. Three things about it drive everything
 1. **It runs `node <entry file>`. It never runs `tsc` for you.** TypeScript has to be compiled
    somewhere — on your machine before upload, or on the container at boot.
 2. **It runs `npm install` itself**, but the container has no C compiler. `better-sqlite3` is a
-   native module, so it must find a *prebuilt* Linux binary — which means the panel's Node version
-   has to be one that a prebuilt exists for. See
-   [Node version](#node-version-this-is-the-one-that-bites): the single most likely thing to break
-   your first deploy.
+   native module, so it needs a *prebuilt* Linux binary — which means both the Node version and
+   npm's install-script policy have to cooperate. See
+   [Could not locate the bindings file](#error-could-not-locate-the-bindings-file): between them,
+   the most likely thing to break your first deploy.
 3. **`dist/`, `config.json` and `.env` are all gitignored**, so none of them arrive via GitHub. This
    is the thing that makes the GitHub route different from the zip route, and it's handled below.
 
@@ -42,12 +42,16 @@ root — the entry point is compiled output. Getting this wrong fails every boot
 Start command:
 
 ```sh
-cd /home/container && npm install --no-fund --no-audit && npm run build && exec node ${STARTUP_FILE}
+cd /home/container && npm install --no-fund --no-audit && if ! node -e "require('better-sqlite3')" 2>/dev/null; then npm rebuild better-sqlite3 --no-fund; fi && npm run build && exec node ${STARTUP_FILE}
 ```
 
 Note there is **no `--omit=dev` on this route** — `npm run build` needs `typescript`, which is a
 devDependency. That costs ~26 MB of disk and a few seconds of `tsc` on each restart. That is the
 price of not committing build output; if you'd rather not pay it, use [Route B](#route-b--zip-upload).
+
+The `if ! node -e "require('better-sqlite3')"` guard is load-bearing on a host that blocks
+install scripts — see [the bindings error](#error-could-not-locate-the-bindings-file). It costs one
+process spawn on a healthy boot and repairs the tree on a broken one.
 
 Keep the `exec`. It makes Node PID 1, so the panel's **Stop** delivers `SIGTERM` directly to it —
 that's what runs each feature's `teardown()` and closes SQLite cleanly.
@@ -106,7 +110,7 @@ Same Startup settings as Route A, except the start command can skip the build an
 dependencies:
 
 ```sh
-cd /home/container && if [ -f package.json ]; then npm install --omit=dev --no-fund --no-audit; fi && exec node ${STARTUP_FILE}
+cd /home/container && npm install --omit=dev --no-fund --no-audit && if ! node -e "require('better-sqlite3')" 2>/dev/null; then npm rebuild better-sqlite3 --no-fund; fi && exec node ${STARTUP_FILE}
 ```
 
 Config works the same way — Env tab for the token, `config.json` uploaded once. Or
@@ -115,27 +119,64 @@ holds your bot token, so delete it from Downloads afterwards.
 
 ---
 
-## Node version — this is the one that bites
+## `Error: Could not locate the bindings file`
+
+`better-sqlite3` installed, but its compiled `.node` binary is missing. Two different causes —
+check the `npm install` output before assuming which:
+
+### Cause 1: npm blocked the install script (most likely)
+
+```
+npm warn install-scripts 2 packages had install scripts blocked because they are not covered by allowScripts:
+npm warn install-scripts   better-sqlite3@11.10.0 (install: node-gyp rebuild)
+```
+
+npm 12 blocks dependency install scripts by default. For `better-sqlite3` that script *is* the
+download step —
+
+```json
+"install": "prebuild-install || node-gyp rebuild --release"
+```
+
+— so blocking it means `prebuild-install` never runs and no binary is ever fetched. Nothing to do
+with the compiler, and it happens even on a perfectly good Node version.
+
+Fixed by the `allowScripts` field in `package.json`:
+
+```json
+"allowScripts": {
+  "better-sqlite3": true,
+  "esbuild": true
+}
+```
+
+Entries are name-only rather than pinned (`better-sqlite3@11.10.0`) so a patch bump doesn't
+silently re-break the deploy.
+
+**Adding the field is not enough on its own.** npm sees the package as already installed and reports
+`up to date` without re-running anything, so a container that already failed this way stays broken.
+That's what the `npm rebuild better-sqlite3` guard in the start command is for — it re-runs the
+install script on a tree that's already there. Failing that, delete `node_modules` in the File
+Manager and restart.
+
+### Cause 2: the Node version has no prebuild
 
 `better-sqlite3@11` publishes prebuilt Linux binaries for Node **18, 20, 22 and 23 only**
-(ABI 108/115/127/131). There is no Node 24 build. On Node 24 the panel's `npm install` falls back to
-compiling from source, finds no `python3`/`g++`, and the deploy dies with something like:
+(ABI 108/115/127/131). There is no Node 24 build, so on Node 24 the install script falls back to
+compiling from source, finds no `python3`/`g++`, and dies with `gyp ERR! find Python`.
+
+The bottom line of the error tells you which case you're in — it names the ABI it looked for:
 
 ```
-gyp ERR! find Python
+→ .../better-sqlite3/lib/binding/node-v127-linux-x64/better_sqlite3.node
 ```
 
-or, if install "succeeded" oddly, at boot:
+`node-v127` is Node 22, which *does* have a prebuild — so that message means Cause 1, not a version
+problem. `node-v137` would mean Node 24 and Cause 2.
 
-```
-Error: Could not locate the bindings file
-```
-
-**Fix: set the panel's Node version to 22.** `package.json` declares `"node": ">=20.10.0 <24"` so
-`npm install` warns you rather than failing silently.
-
-If you ever want Node 24, bump `better-sqlite3` to `^12` (which ships ABI 137 prebuilds) and rerun
-`npm test` before shipping.
+**Fix for Cause 2: set the panel's Node version to 22.** `package.json` declares
+`"node": ">=20.10.0 <24"` so npm warns rather than failing silently. If you ever want Node 24, bump
+`better-sqlite3` to `^12` (which ships ABI 137 prebuilds) and rerun `npm test` before shipping.
 
 ---
 
